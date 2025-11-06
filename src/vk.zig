@@ -653,12 +653,15 @@ fn createGraphicsPipeline(
         frag_shader_stage,
     };
 
+    const binding_description = Vertex.getBindingDescription();
+    const attribute_descriptions = Vertex.getAttributeDescriptions();
+
     const vertex_input_state = c.VkPipelineVertexInputStateCreateInfo{
         .sType = c.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .vertexBindingDescriptionCount = 0,
-        .pVertexBindingDescriptions = null,
-        .vertexAttributeDescriptionCount = 0,
-        .pVertexAttributeDescriptions = null,
+        .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = &binding_description,
+        .vertexAttributeDescriptionCount = attribute_descriptions.len,
+        .pVertexAttributeDescriptions = &attribute_descriptions,
     };
 
     const input_assembly_state = c.VkPipelineInputAssemblyStateCreateInfo{
@@ -1016,3 +1019,43 @@ pub fn drawFrame(self: @This()) !void {
 
     current_frame = (current_frame + 1) % max_frames_in_flight;
 }
+
+const Vertex = struct {
+    pos: [2]f32,
+    color: [3]f32,
+
+    pub fn getBindingDescription() c.VkVertexInputBindingDescription {
+        const binding_description = c.VkVertexInputBindingDescription{
+            .binding = 0,
+            .stride = @sizeOf(Vertex),
+            .inputRate = c.VK_VERTEX_INPUT_RATE_VERTEX,
+        };
+
+        return binding_description;
+    }
+
+    pub fn getAttributeDescriptions() [2]c.VkVertexInputAttributeDescription {
+        const attribute_descriptions = [2]c.VkVertexInputAttributeDescription{
+            .{
+                .binding = 0,
+                .location = 0,
+                .format = c.VK_FORMAT_R32G32_SFLOAT,
+                .offset = @offsetOf(Vertex, "pos"),
+            },
+            .{
+                .binding = 0,
+                .location = 1,
+                .format = c.VK_FORMAT_R32G32B32_SFLOAT,
+                .offset = @offsetOf(Vertex, "color"),
+            },
+        };
+
+        return attribute_descriptions;
+    }
+};
+
+const vertices = [_]Vertex{
+    .{ .pos = .{ 0.0, -0.5 }, .color = .{ 1.0, 0.0, 0.0 } },
+    .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0.0, 1.0, 0.0 } },
+    .{ .pos = .{ -0.5, 0.5 }, .color = .{ 0.0, 0.0, 1.0 } },
+};
