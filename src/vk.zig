@@ -20,16 +20,16 @@ const QueueFamilyIndices = struct {
 };
 
 test "QueueFamilyIndices methods" {
-    var indices: QueueFamilyIndices = .{
+    var queue_family_indices: QueueFamilyIndices = .{
         .graphics_family = 1,
         .present_family = 1,
     };
-    try std.testing.expect(indices.same());
+    try std.testing.expect(queue_family_indices.same());
 
     indices.present_family = 2;
-    try std.testing.expect(!indices.same());
+    try std.testing.expect(!queue_family_indices.same());
 
-    try std.testing.expectEqual(indices.to_array(), [_]u32{ 1, 2 });
+    try std.testing.expectEqual(queue_family_indices.to_array(), [_]u32{ 1, 2 });
 }
 
 const SwapChainSupportDetails = struct {
@@ -78,10 +78,12 @@ const height = 360;
 const max_frames_in_flight: u8 = 2;
 
 const vertices = [_]Vertex{
-    .{ .pos = .{ 0.0, -0.5 }, .color = .{ 1.0, 0.0, 0.0 } },
-    .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0.0, 1.0, 0.0 } },
-    .{ .pos = .{ -0.5, 0.5 }, .color = .{ 0.0, 0.0, 1.0 } },
+    .{ .pos = .{ -0.5, -0.5 }, .color = .{ 1.0, 0.0, 0.0 } },
+    .{ .pos = .{ 0.5, -0.5 }, .color = .{ 0.0, 1.0, 0.0 } },
+    .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0.0, 0.0, 1.0 } },
+    .{ .pos = .{ -0.5, 0.5 }, .color = .{ 1.0, 1.0, 1.0 } },
 };
+const indices = [_]u16{ 0, 1, 2, 2, 3, 0 };
 
 var current_frame: u32 = 0;
 
@@ -103,6 +105,8 @@ pipeline: c.VkPipeline,
 command_pool: c.VkCommandPool,
 vertex_buffer: c.VkBuffer,
 vertex_buffer_memory: c.VkDeviceMemory,
+index_buffer: c.VkBuffer,
+index_buffer_memory: c.VkDeviceMemory,
 command_buffers: []c.VkCommandBuffer,
 image_available_semaphores: []c.VkSemaphore,
 render_finished_semaphores: []c.VkSemaphore,
@@ -227,6 +231,17 @@ pub fn init(
         graphics_queue,
     );
 
+    var index_buffer: c.VkBuffer = undefined;
+    var index_buffer_memory: c.VkDeviceMemory = undefined;
+    try createIndexBuffer(
+        device,
+        mem_properties,
+        &index_buffer,
+        &index_buffer_memory,
+        command_pool,
+        graphics_queue,
+    );
+
     const command_buffers = try createCommandBuffers(allocator, device, command_pool);
 
     const sync_objects = try createSyncObjects(allocator, device);
@@ -250,6 +265,8 @@ pub fn init(
         .command_pool = command_pool,
         .vertex_buffer = vertex_buffer,
         .vertex_buffer_memory = vertex_buffer_memory,
+        .index_buffer = index_buffer,
+        .index_buffer_memory = index_buffer_memory,
         .command_buffers = command_buffers,
         .image_available_semaphores = sync_objects.image_available_semaphores,
         .render_finished_semaphores = sync_objects.render_finished_semaphores,
@@ -265,6 +282,8 @@ pub fn destroy(self: @This()) void {
         c.vkDestroySemaphore(self.device, self.render_finished_semaphores[i], null);
         c.vkDestroyFence(self.device, self.in_flight_fences[i], null);
     }
+    c.vkDestroyBuffer(self.device, self.index_buffer, null);
+    c.vkFreeMemory(self.device, self.index_buffer_memory, null);
     c.vkDestroyBuffer(self.device, self.vertex_buffer, null);
     c.vkFreeMemory(self.device, self.vertex_buffer_memory, null);
     c.vkDestroyCommandPool(self.device, self.command_pool, null);
@@ -337,7 +356,7 @@ fn findQueueFamilies(
     device: c.VkPhysicalDevice,
     surface: c.VkSurfaceKHR,
 ) !QueueFamilyIndices {
-    var indices: QueueFamilyIndices = undefined;
+    var queue_family_indices: QueueFamilyIndices = undefined;
 
     var queue_family_count: u32 = 0;
     c.vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_family_count, null);
@@ -348,16 +367,16 @@ fn findQueueFamilies(
     var present_support: c.VkBool32 = c.VK_FALSE;
     for (queue_families, 0..) |queue_family, i| {
         if (queue_family.queueFlags & c.VK_QUEUE_GRAPHICS_BIT != 0) {
-            indices.graphics_family = @intCast(i);
+            queue_family_indices.graphics_family = @intCast(i);
         }
 
         _ = c.vkGetPhysicalDeviceSurfaceSupportKHR(device, @intCast(i), surface, &present_support);
-        if (present_support == c.VK_TRUE) indices.present_family = @intCast(i);
+        if (present_support == c.VK_TRUE) queue_family_indices.present_family = @intCast(i);
 
-        if (indices.graphics_family != null and indices.present_family != null) break;
+        if (queue_family_indices.graphics_family != null and queue_family_indices.present_family != null) break;
     }
 
-    return indices;
+    return queue_family_indices;
 }
 
 fn isDeviceSuitable(
@@ -956,6 +975,52 @@ fn createBuffer(
     _ = c.vkBindBufferMemory(device, buffer.*, buffer_memory.*, 0);
 }
 
+fn copyBuffer(
+    device: c.VkDevice,
+    src_buffer: c.VkBuffer,
+    dst_buffer: c.VkBuffer,
+    size: c.VkDeviceSize,
+    command_pool: c.VkCommandPool,
+    graphics_queue: c.VkQueue,
+) !void {
+    const alloc_info = c.VkCommandBufferAllocateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandPool = command_pool,
+        .commandBufferCount = 1,
+    };
+
+    var command_buffer: c.VkCommandBuffer = undefined;
+    _ = c.vkAllocateCommandBuffers(device, &alloc_info, &command_buffer);
+
+    const begin_info = c.VkCommandBufferBeginInfo{
+        .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+
+    _ = c.vkBeginCommandBuffer(command_buffer, &begin_info);
+
+    const copy_region = c.VkBufferCopy{
+        .srcOffset = 0, // Optional
+        .dstOffset = 0, // Optional
+        .size = size,
+    };
+    c.vkCmdCopyBuffer(command_buffer, src_buffer, dst_buffer, 1, &copy_region);
+
+    _ = c.vkEndCommandBuffer(command_buffer);
+
+    const submit_info = c.VkSubmitInfo{
+        .sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &command_buffer,
+    };
+
+    _ = c.vkQueueSubmit(graphics_queue, 1, &submit_info, null);
+    _ = c.vkQueueWaitIdle(graphics_queue);
+
+    c.vkFreeCommandBuffers(device, command_pool, 1, &command_buffer);
+}
+
 fn createVertexBuffer(
     device: c.VkDevice,
     mem_properties: c.VkPhysicalDeviceMemoryProperties,
@@ -1010,50 +1075,58 @@ fn createVertexBuffer(
     c.vkFreeMemory(device, staging_buffer_memory, null);
 }
 
-fn copyBuffer(
+fn createIndexBuffer(
     device: c.VkDevice,
-    src_buffer: c.VkBuffer,
-    dst_buffer: c.VkBuffer,
-    size: c.VkDeviceSize,
+    mem_properties: c.VkPhysicalDeviceMemoryProperties,
+    buffer: *c.VkBuffer,
+    buffer_memory: *c.VkBuffer,
     command_pool: c.VkCommandPool,
     graphics_queue: c.VkQueue,
 ) !void {
-    const alloc_info = c.VkCommandBufferAllocateInfo{
-        .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandPool = command_pool,
-        .commandBufferCount = 1,
-    };
+    const size: c.VkDeviceSize = @sizeOf(u16) * indices.len;
 
-    var command_buffer: c.VkCommandBuffer = undefined;
-    _ = c.vkAllocateCommandBuffers(device, &alloc_info, &command_buffer);
+    var staging_buffer: c.VkBuffer = undefined;
+    var staging_buffer_memory: c.VkDeviceMemory = undefined;
+    try createBuffer(
+        device,
+        size,
+        c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        mem_properties,
+        c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        &staging_buffer,
+        &staging_buffer_memory,
+    );
 
-    const begin_info = c.VkCommandBufferBeginInfo{
-        .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    };
+    var data: ?*anyopaque = null;
+    _ = c.vkMapMemory(device, staging_buffer_memory, 0, size, 0, &data);
+    if (data) |ptr| {
+        const dest = @as([*]u8, @ptrCast(ptr))[0..size];
+        const source: [*]u8 = @ptrCast(@constCast(&indices));
+        @memcpy(dest, source);
+    }
+    _ = c.vkUnmapMemory(device, staging_buffer_memory);
 
-    _ = c.vkBeginCommandBuffer(command_buffer, &begin_info);
+    try createBuffer(
+        device,
+        size,
+        c.VK_BUFFER_USAGE_TRANSFER_DST_BIT | c.VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+        mem_properties,
+        c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        buffer,
+        buffer_memory,
+    );
 
-    const copy_region = c.VkBufferCopy{
-        .srcOffset = 0, // Optional
-        .dstOffset = 0, // Optional
-        .size = size,
-    };
-    c.vkCmdCopyBuffer(command_buffer, src_buffer, dst_buffer, 1, &copy_region);
+    try copyBuffer(
+        device,
+        staging_buffer,
+        buffer.*,
+        size,
+        command_pool,
+        graphics_queue,
+    );
 
-    _ = c.vkEndCommandBuffer(command_buffer);
-
-    const submit_info = c.VkSubmitInfo{
-        .sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &command_buffer,
-    };
-
-    _ = c.vkQueueSubmit(graphics_queue, 1, &submit_info, null);
-    _ = c.vkQueueWaitIdle(graphics_queue);
-
-    c.vkFreeCommandBuffers(device, command_pool, 1, &command_buffer);
+    c.vkDestroyBuffer(device, staging_buffer, null);
+    c.vkFreeMemory(device, staging_buffer_memory, null);
 }
 
 fn createCommandBuffers(
@@ -1119,7 +1192,10 @@ fn recordCommandBuffer(
     const offsets = [_]c.VkDeviceSize{0};
     c.vkCmdBindVertexBuffers(command_buffer, 0, 1, &vertex_buffers, &offsets);
 
-    c.vkCmdDraw(command_buffer, vertices.len, 1, 0, 0);
+    c.vkCmdBindIndexBuffer(command_buffer, self.index_buffer, 0, c.VK_INDEX_TYPE_UINT16);
+
+    //c.vkCmdDraw(command_buffer, vertices.len, 1, 0, 0);
+    c.vkCmdDrawIndexed(command_buffer, indices.len, 1, 0, 0, 0);
 
     c.vkCmdEndRenderPass(command_buffer);
     std.debug.assert(c.vkEndCommandBuffer(command_buffer) == c.VK_SUCCESS);
