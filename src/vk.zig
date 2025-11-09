@@ -72,10 +72,20 @@ const Vertex = struct {
     }
 };
 
+const Mat4 = [4][4]f32;
+
+const UniformBufferObject = struct {
+    model: Mat4,
+    view: Mat4,
+    proj: Mat4,
+};
+
 const required_device_extensions = [_][]const u8{c.VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 const width = 640;
 const height = 360;
 const max_frames_in_flight: u8 = 2;
+
+var start_time: i64 = undefined;
 
 const vertices = [_]Vertex{
     .{ .pos = .{ -0.5, -0.5 }, .color = .{ 1.0, 0.0, 0.0 } },
@@ -100,6 +110,7 @@ swapchain_images: []c.VkImage,
 swapchain_image_views: []c.VkImageView,
 swapchain_framebuffers: []c.VkFramebuffer,
 render_pass: c.VkRenderPass,
+descriptor_set_layout: c.VkDescriptorSetLayout,
 pipeline_layout: c.VkPipelineLayout,
 pipeline: c.VkPipeline,
 command_pool: c.VkCommandPool,
@@ -107,6 +118,11 @@ vertex_buffer: c.VkBuffer,
 vertex_buffer_memory: c.VkDeviceMemory,
 index_buffer: c.VkBuffer,
 index_buffer_memory: c.VkDeviceMemory,
+uniform_buffers: []c.VkBuffer,
+uniform_buffers_memory: []c.VkDeviceMemory,
+uniform_buffers_mapped: []?*anyopaque,
+descriptor_pool: c.VkDescriptorPool,
+descriptor_sets: []c.VkDescriptorSet,
 command_buffers: []c.VkCommandBuffer,
 image_available_semaphores: []c.VkSemaphore,
 render_finished_semaphores: []c.VkSemaphore,
@@ -117,6 +133,8 @@ pub fn init(
     hinstance: win.HINSTANCE,
     window_hwnd: win.HWND,
 ) !@This() {
+    start_time = std.time.microTimestamp();
+
     const vk_instance = try createInstance();
     const surface = try createSurface(vk_instance, hinstance, window_hwnd);
 
@@ -205,8 +223,10 @@ pub fn init(
 
     const render_pass = try createRenderPass(device, surface_format.format);
 
+    const descriptor_set_layout = try createDescriptorSetLayout(device);
+
     var pipeline_layout: c.VkPipelineLayout = undefined;
-    const pipeline = try createGraphicsPipeline(device, extent, render_pass, &pipeline_layout);
+    const pipeline = try createGraphicsPipeline(device, extent, render_pass, &pipeline_layout, descriptor_set_layout);
 
     const swapchain_framebuffers = try createFramebuffers(
         allocator,
@@ -242,6 +262,20 @@ pub fn init(
         graphics_queue,
     );
 
+    const uniform_buffers = try allocator.alloc(c.VkBuffer, max_frames_in_flight);
+    const uniform_buffers_memory = try allocator.alloc(c.VkDeviceMemory, max_frames_in_flight);
+    const uniform_buffers_mapped = try allocator.alloc(?*anyopaque, max_frames_in_flight);
+    try createUniformBuffers(device, mem_properties, uniform_buffers, uniform_buffers_memory, uniform_buffers_mapped);
+
+    const descriptor_pool = try createDescriptorPool(device);
+    const descriptor_sets = try createDescriptorSets(
+        allocator,
+        device,
+        descriptor_set_layout,
+        descriptor_pool,
+        uniform_buffers,
+    );
+
     const command_buffers = try createCommandBuffers(allocator, device, command_pool);
 
     const sync_objects = try createSyncObjects(allocator, device);
@@ -260,6 +294,7 @@ pub fn init(
         .swapchain_image_views = swapchain_image_views,
         .swapchain_framebuffers = swapchain_framebuffers,
         .render_pass = render_pass,
+        .descriptor_set_layout = descriptor_set_layout,
         .pipeline_layout = pipeline_layout,
         .pipeline = pipeline,
         .command_pool = command_pool,
@@ -267,6 +302,11 @@ pub fn init(
         .vertex_buffer_memory = vertex_buffer_memory,
         .index_buffer = index_buffer,
         .index_buffer_memory = index_buffer_memory,
+        .uniform_buffers = uniform_buffers,
+        .uniform_buffers_memory = uniform_buffers_memory,
+        .uniform_buffers_mapped = uniform_buffers_mapped,
+        .descriptor_pool = descriptor_pool,
+        .descriptor_sets = descriptor_sets,
         .command_buffers = command_buffers,
         .image_available_semaphores = sync_objects.image_available_semaphores,
         .render_finished_semaphores = sync_objects.render_finished_semaphores,
@@ -292,7 +332,15 @@ pub fn destroy(self: @This()) void {
     }
     c.vkDestroyPipeline(self.device, self.pipeline, null);
     c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
+    for (0..max_frames_in_flight) |i| {
+        c.vkDestroyBuffer(self.device, self.uniform_buffers[i], null);
+        c.vkFreeMemory(self.device, self.uniform_buffers_memory[i], null);
+    }
+    c.vkDestroyDescriptorSetLayout(self.device, self.descriptor_set_layout, null);
+    c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
     c.vkDestroyRenderPass(self.device, self.render_pass, null);
+    c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
+    c.vkDestroyDescriptorSetLayout(self.device, self.descriptor_set_layout, null);
     for (self.swapchain_image_views) |image_view| {
         c.vkDestroyImageView(self.device, image_view, null);
     }
@@ -698,11 +746,33 @@ fn createRenderPass(device: c.VkDevice, swapchain_image_format: c.VkFormat) !c.V
     return render_pass;
 }
 
+fn createDescriptorSetLayout(device: c.VkDevice) !c.VkDescriptorSetLayout {
+    const ubo_layout_binding = c.VkDescriptorSetLayoutBinding{
+        .binding = 0,
+        .descriptorType = c.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT,
+        .pImmutableSamplers = null, // Optional
+    };
+
+    const layout_info = c.VkDescriptorSetLayoutCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1,
+        .pBindings = &ubo_layout_binding,
+    };
+
+    var descriptor_set_layout: c.VkDescriptorSetLayout = undefined;
+    std.debug.assert(c.vkCreateDescriptorSetLayout(device, &layout_info, null, &descriptor_set_layout) == c.VK_SUCCESS);
+
+    return descriptor_set_layout;
+}
+
 fn createGraphicsPipeline(
     device: c.VkDevice,
     swapchain_extent: c.VkExtent2D,
     render_pass: c.VkRenderPass,
     pipeline_layout: *c.VkPipelineLayout,
+    descriptor_set_layout: c.VkDescriptorSetLayout,
 ) !c.VkPipeline {
     const vert_shader align(4) = @embedFile("shaders/vert.spv").*;
     const vert_shader_module: c.VkShaderModule = try createShaderModule(&vert_shader, device);
@@ -790,7 +860,7 @@ fn createGraphicsPipeline(
         .polygonMode = c.VK_POLYGON_MODE_FILL,
         .lineWidth = 1.0,
         .cullMode = c.VK_CULL_MODE_BACK_BIT,
-        .frontFace = c.VK_FRONT_FACE_CLOCKWISE,
+        .frontFace = c.VK_FRONT_FACE_COUNTER_CLOCKWISE,
         .depthBiasEnable = c.VK_FALSE,
         .depthBiasConstantFactor = 0.0,
         .depthBiasClamp = 0.0,
@@ -829,10 +899,8 @@ fn createGraphicsPipeline(
 
     const pipeline_layout_info = c.VkPipelineLayoutCreateInfo{
         .sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 0,
-        .pSetLayouts = null,
-        .pushConstantRangeCount = 0,
-        .pPushConstantRanges = null,
+        .setLayoutCount = 1,
+        .pSetLayouts = &descriptor_set_layout,
     };
 
     std.debug.assert(
@@ -1129,6 +1197,92 @@ fn createIndexBuffer(
     c.vkFreeMemory(device, staging_buffer_memory, null);
 }
 
+fn createUniformBuffers(
+    device: c.VkDevice,
+    mem_properties: c.VkPhysicalDeviceMemoryProperties,
+    uniform_buffers: []c.VkBuffer,
+    uniform_buffers_memory: []c.VkDeviceMemory,
+    uniform_buffers_mapped: []?*anyopaque,
+) !void {
+    const buffer_size: c.VkDeviceSize = @sizeOf(UniformBufferObject);
+
+    for (0..max_frames_in_flight) |i| {
+        try createBuffer(
+            device,
+            buffer_size,
+            c.VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            mem_properties,
+            c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &uniform_buffers[i],
+            &uniform_buffers_memory[i],
+        );
+
+        _ = c.vkMapMemory(device, uniform_buffers_memory[i], 0, buffer_size, 0, &uniform_buffers_mapped[i]);
+    }
+}
+
+fn createDescriptorPool(device: c.VkDevice) !c.VkDescriptorPool {
+    const pool_size = c.VkDescriptorPoolSize{
+        .type = c.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .descriptorCount = @intCast(max_frames_in_flight),
+    };
+
+    const pool_info = c.VkDescriptorPoolCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .poolSizeCount = 1,
+        .pPoolSizes = &pool_size,
+        .maxSets = @intCast(max_frames_in_flight),
+    };
+
+    var descriptor_pool: c.VkDescriptorPool = undefined;
+    std.debug.assert(c.vkCreateDescriptorPool(device, &pool_info, null, &descriptor_pool) == c.VK_SUCCESS);
+
+    return descriptor_pool;
+}
+
+fn createDescriptorSets(
+    allocator: std.mem.Allocator,
+    device: c.VkDevice,
+    descriptor_set_layout: c.VkDescriptorSetLayout,
+    descriptor_pool: c.VkDescriptorPool,
+    uniform_buffers: []c.VkBuffer,
+) ![]c.VkDescriptorSet {
+    const layouts = [_]c.VkDescriptorSetLayout{descriptor_set_layout} ** max_frames_in_flight;
+    const alloc_info = c.VkDescriptorSetAllocateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = descriptor_pool,
+        .descriptorSetCount = @intCast(max_frames_in_flight),
+        .pSetLayouts = &layouts,
+    };
+
+    const descriptor_sets = try allocator.alloc(c.VkDescriptorSet, max_frames_in_flight);
+    std.debug.assert(c.vkAllocateDescriptorSets(device, &alloc_info, descriptor_sets.ptr) == c.VK_SUCCESS);
+
+    for (0..max_frames_in_flight) |i| {
+        const buffer_info = c.VkDescriptorBufferInfo{
+            .buffer = uniform_buffers[i],
+            .offset = 0,
+            .range = @sizeOf(UniformBufferObject),
+        };
+
+        const descriptor_write = c.VkWriteDescriptorSet{
+            .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = descriptor_sets[i],
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorType = c.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .pBufferInfo = &buffer_info,
+            .pImageInfo = null, // Optional
+            .pTexelBufferView = null, // Optional
+        };
+
+        c.vkUpdateDescriptorSets(device, 1, &descriptor_write, 0, null);
+    }
+
+    return descriptor_sets;
+}
+
 fn createCommandBuffers(
     allocator: std.mem.Allocator,
     device: c.VkDevice,
@@ -1194,6 +1348,17 @@ fn recordCommandBuffer(
 
     c.vkCmdBindIndexBuffer(command_buffer, self.index_buffer, 0, c.VK_INDEX_TYPE_UINT16);
 
+    c.vkCmdBindDescriptorSets(
+        command_buffer,
+        c.VK_PIPELINE_BIND_POINT_GRAPHICS,
+        self.pipeline_layout,
+        0,
+        1,
+        &self.descriptor_sets[current_frame],
+        0,
+        null,
+    );
+
     //c.vkCmdDraw(command_buffer, vertices.len, 1, 0, 0);
     c.vkCmdDrawIndexed(command_buffer, indices.len, 1, 0, 0, 0);
 
@@ -1256,10 +1421,88 @@ fn createSyncObjects(
         .in_flight_fences = in_flight_fences,
     };
 }
+fn rotate(angle: f32, axis: [3]f32) [4][4]f32 {
+    const cos_a = @cos(angle);
+    const sin_a = @sin(angle);
+    const one_minus_cos = 1.0 - cos_a;
+    const x = axis[0];
+    const y = axis[1];
+    const z = axis[2];
+
+    return [4][4]f32{
+        .{ cos_a + x * x * one_minus_cos, x * y * one_minus_cos - z * sin_a, x * z * one_minus_cos + y * sin_a, 0.0 },
+        .{ y * x * one_minus_cos + z * sin_a, cos_a + y * y * one_minus_cos, y * z * one_minus_cos - x * sin_a, 0.0 },
+        .{ z * x * one_minus_cos - y * sin_a, z * y * one_minus_cos + x * sin_a, cos_a + z * z * one_minus_cos, 0.0 },
+        .{ 0.0, 0.0, 0.0, 1.0 },
+    };
+}
+
+fn lookAt(eye: [3]f32, center: [3]f32, up: [3]f32) [4][4]f32 {
+    const f = normalize(.{ center[0] - eye[0], center[1] - eye[1], center[2] - eye[2] });
+    const s = normalize(cross(f, up));
+    const u = cross(s, f);
+
+    return [4][4]f32{
+        .{ s[0], u[0], -f[0], 0.0 },
+        .{ s[1], u[1], -f[1], 0.0 },
+        .{ s[2], u[2], -f[2], 0.0 },
+        .{ -dot(s, eye), -dot(u, eye), dot(f, eye), 1.0 },
+    };
+}
+
+fn perspective(fov: f32, aspect: f32, near: f32, far: f32) [4][4]f32 {
+    const tan_half_fov = @tan(fov / 2.0);
+    const f = 1.0 / tan_half_fov;
+
+    return [4][4]f32{
+        .{ f / aspect, 0.0, 0.0, 0.0 },
+        .{ 0.0, f, 0.0, 0.0 },
+        .{ 0.0, 0.0, far / (near - far), -1.0 },
+        .{ 0.0, 0.0, (near * far) / (near - far), 0.0 },
+    };
+}
+
+// Vector math helpers
+fn dot(a: [3]f32, b: [3]f32) f32 {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+fn cross(a: [3]f32, b: [3]f32) [3]f32 {
+    return .{
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    };
+}
+
+fn normalize(v: [3]f32) [3]f32 {
+    const len = @sqrt(dot(v, v));
+    return .{ v[0] / len, v[1] / len, v[2] / len };
+}
+
+fn updateUniformBuffer(current_image: u32, swapchain_extent: c.VkExtent2D, uniform_buffers_mapped: []?*anyopaque) !void {
+    const current_time = std.time.microTimestamp();
+    const time = @as(f32, @floatFromInt(current_time - start_time)) / 1_000_000.0; // Convert to seconds
+
+    var ubo = UniformBufferObject{
+        .model = rotate(time * std.math.degreesToRadians(90.0), .{ 0.0, 0.0, 1.0 }),
+        .view = lookAt(.{ 2.0, 2.0, 2.0 }, .{ 0.0, 0.0, 0.0 }, .{ 0.0, 0.0, 1.0 }),
+        .proj = perspective(
+            std.math.degreesToRadians(45.0),
+            @as(f32, @floatFromInt(swapchain_extent.width)) / @as(f32, @floatFromInt(swapchain_extent.height)),
+            0.1,
+            10.0,
+        ),
+    };
+    ubo.proj[1][1] *= -1;
+
+    const dest = @as([*]u8, @ptrCast(uniform_buffers_mapped[current_image]))[0..@sizeOf(UniformBufferObject)];
+    const src = @as([*]const u8, @ptrCast(&ubo));
+    @memcpy(dest, src);
+}
 
 pub fn drawFrame(self: @This()) !void {
     _ = c.vkWaitForFences(self.device, 1, &self.in_flight_fences[current_frame], c.VK_TRUE, c.UINT64_MAX);
-    _ = c.vkResetFences(self.device, 1, &self.in_flight_fences[current_frame]);
 
     var image_index: u32 = undefined;
     _ = c.vkAcquireNextImageKHR(
@@ -1270,6 +1513,10 @@ pub fn drawFrame(self: @This()) !void {
         null,
         &image_index,
     );
+
+    try updateUniformBuffer(current_frame, self.swapchain_extent, self.uniform_buffers_mapped);
+
+    _ = c.vkResetFences(self.device, 1, &self.in_flight_fences[current_frame]);
 
     _ = c.vkResetCommandBuffer(self.command_buffers[current_frame], 0);
     try self.recordCommandBuffer(self.command_buffers[current_frame], image_index);
