@@ -92,6 +92,18 @@ pub fn build(b: *std.Build) void {
     exe.addLibraryPath(.{ .cwd_relative = vulkan_sdk ++ "Lib" });
     exe.linkSystemLibrary("vulkan-1");
 
+    exe.addIncludePath(.{ .cwd_relative = "src" });
+    exe.addLibraryPath(.{ .cwd_relative = "src" });
+    exe.addCSourceFile(.{
+        .file = .{ .cwd_relative = "src/stb_image.c" },
+        .flags = &[_][]const u8{
+            "-Wall",
+            "-Wextra",
+            "-O3",
+            "-DSTB_IMAGE_IMPLEMENTATION",
+        },
+    });
+
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
