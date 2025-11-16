@@ -118,6 +118,8 @@ pipeline: c.VkPipeline,
 command_pool: c.VkCommandPool,
 texture_image: c.VkImage,
 texture_image_memory: c.VkDeviceMemory,
+texture_image_view: c.VkImageView,
+texture_sampler: c.VkSampler,
 vertex_buffer: c.VkBuffer,
 vertex_buffer_memory: c.VkDeviceMemory,
 index_buffer: c.VkBuffer,
@@ -141,8 +143,6 @@ pub fn init(
 
     const vk_instance = try createInstance();
     const surface = try createSurface(vk_instance, hinstance, window_hwnd);
-
-    // TODO let user specify which device to use (user_set_device param)
 
     const physical_devices: []c.VkPhysicalDevice = try getPhysicalDevices(allocator, vk_instance);
     defer allocator.free(physical_devices);
@@ -178,12 +178,14 @@ pub fn init(
         queue_family_indices.present_family.?,
     });
 
-    const enabled_features: c.VkPhysicalDeviceFeatures = .{};
+    const device_features = c.VkPhysicalDeviceFeatures{
+        .samplerAnisotropy = c.VK_TRUE,
+    };
     const device: c.VkDevice = try createLogicalDevice(
         allocator,
         physical_device,
         queue_family_indices,
-        enabled_features,
+        device_features,
     );
 
     var graphics_queue: c.VkQueue = undefined;
@@ -249,6 +251,9 @@ pub fn init(
     var texture_image_memory: c.VkDeviceMemory = undefined;
     try createTextureImage(device, command_pool, graphics_queue, mem_properties, &texture_image, &texture_image_memory);
 
+    const texture_image_view = try createTextureImageView(device, texture_image);
+    const texture_sampler = try createTextureSampler(device, device_properties);
+
     var vertex_buffer: c.VkBuffer = undefined;
     var vertex_buffer_memory: c.VkDeviceMemory = undefined;
     try createVertexBuffer(
@@ -309,6 +314,8 @@ pub fn init(
         .command_pool = command_pool,
         .texture_image = texture_image,
         .texture_image_memory = texture_image_memory,
+        .texture_image_view = texture_image_view,
+        .texture_sampler = texture_sampler,
         .vertex_buffer = vertex_buffer,
         .vertex_buffer_memory = vertex_buffer_memory,
         .index_buffer = index_buffer,
@@ -351,6 +358,9 @@ pub fn destroy(self: @This()) void {
     c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
     c.vkDestroyRenderPass(self.device, self.render_pass, null);
     c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
+
+    c.vkDestroySampler(self.device, self.texture_sampler, null);
+    c.vkDestroyImageView(self.device, self.texture_image_view, null);
 
     c.vkDestroyImage(self.device, self.texture_image, null);
     c.vkFreeMemory(self.device, self.texture_image_memory, null);
@@ -448,9 +458,6 @@ fn isDeviceSuitable(
     surface: c.VkSurfaceKHR,
     swapchain_support_ptr: *SwapChainSupportDetails,
 ) !bool {
-    //var device_features: c.VkPhysicalDeviceFeatures = undefined;
-    //c.vkGetPhysicalDeviceFeatures(device, &device_features);
-
     var required_extensions: std.BufSet = .init(allocator);
 
     for (required_device_extensions) |extension| try required_extensions.insert(extension);
@@ -473,8 +480,13 @@ fn isDeviceSuitable(
             device,
             surface,
         );
+
+        var supported_features: c.VkPhysicalDeviceFeatures = undefined;
+        c.vkGetPhysicalDeviceFeatures(device, &supported_features);
+
         if (swapchain_support.formats.len != 0 and
-            swapchain_support.present_modes.len != 0)
+            swapchain_support.present_modes.len != 0 and
+            supported_features.samplerAnisotropy != 0)
         {
             swapchain_support_ptr.* = swapchain_support;
             return true;
@@ -675,26 +687,7 @@ fn createImageViews(
     errdefer allocator.free(swapchain_image_views);
 
     for (swapchain_images, 0..) |image, i| {
-        var create_info: c.VkImageViewCreateInfo = .{
-            .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .image = image,
-            .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
-            .format = format,
-            .components = .{
-                .r = c.VK_COMPONENT_SWIZZLE_IDENTITY,
-                .g = c.VK_COMPONENT_SWIZZLE_IDENTITY,
-                .b = c.VK_COMPONENT_SWIZZLE_IDENTITY,
-                .a = c.VK_COMPONENT_SWIZZLE_IDENTITY,
-            },
-            .subresourceRange = .{
-                .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            },
-        };
-        std.debug.assert(c.vkCreateImageView(device, &create_info, null, &swapchain_image_views[i]) == c.VK_SUCCESS);
+        swapchain_image_views[i] = try createImageView(device, image, format);
     }
 
     return swapchain_image_views;
@@ -1094,6 +1087,57 @@ fn createTextureImage(
 
     c.vkDestroyBuffer(device, staging_buffer, null);
     c.vkFreeMemory(device, staging_buffer_memory, null);
+}
+
+fn createTextureImageView(device: c.VkDevice, texture_image: c.VkImage) !c.VkImageView {
+    return try createImageView(device, texture_image, c.VK_FORMAT_R8G8B8A8_SRGB);
+}
+
+fn createTextureSampler(
+    device: c.VkDevice,
+    device_properties: c.VkPhysicalDeviceProperties,
+) !c.VkSampler {
+    const sampler_info = c.VkSamplerCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = c.VK_FILTER_LINEAR,
+        .minFilter = c.VK_FILTER_LINEAR,
+        .addressModeU = c.VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeV = c.VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeW = c.VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .anisotropyEnable = c.VK_TRUE,
+        .maxAnisotropy = device_properties.limits.maxSamplerAnisotropy,
+        .borderColor = c.VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+        .unnormalizedCoordinates = c.VK_FALSE,
+        .compareEnable = c.VK_FALSE,
+        .compareOp = c.VK_COMPARE_OP_ALWAYS,
+        .mipmapMode = c.VK_SAMPLER_MIPMAP_MODE_LINEAR,
+    };
+
+    var texture_sampler: c.VkSampler = undefined;
+    std.debug.assert(c.vkCreateSampler(device, &sampler_info, null, &texture_sampler) == c.VK_SUCCESS);
+
+    return texture_sampler;
+}
+
+fn createImageView(device: c.VkDevice, image: c.VkImage, format: c.VkFormat) !c.VkImageView {
+    const view_info = c.VkImageViewCreateInfo{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = image,
+        .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
+        .format = format,
+        .subresourceRange = .{
+            .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+
+    var image_view: c.VkImageView = undefined;
+    std.debug.assert(c.vkCreateImageView(device, &view_info, null, &image_view) == c.VK_SUCCESS);
+
+    return image_view;
 }
 
 fn createImage(
