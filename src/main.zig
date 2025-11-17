@@ -100,9 +100,9 @@ extern "user32" fn CreateWindowExW(
     hMenu: ?win.HMENU,
     hInstance: ?win.HINSTANCE,
     lpParam: ?win.LPVOID,
-) callconv(.winapi) win.HWND;
+) callconv(.winapi) vk.c.HWND;
 
-extern "user32" fn ShowWindow(hWnd: win.HWND, nCmdShow: i32) callconv(.winapi) win.BOOL;
+extern "user32" fn ShowWindow(hWnd: vk.c.HWND, nCmdShow: i32) callconv(.winapi) win.BOOL;
 
 pub extern "user32" fn GetMessageW(
     lpMsg: *MSG,
@@ -161,11 +161,11 @@ pub fn wWinMain(
     hPrevInstance: ?win.HINSTANCE,
     pCmdLine: ?win.PWSTR,
     nCmdShow: c_int,
-) !win.HWND {
+) !vk.c.HWND {
     _ = hPrevInstance;
     _ = pCmdLine;
 
-    const class_name_raw: []win.WCHAR = try std.unicode.utf8ToUtf16LeAlloc(allocator, "pity window class");
+    const class_name_raw: []win.WCHAR = try std.unicode.utf8ToUtf16LeAlloc(allocator, "zig win32 vulkan");
     defer allocator.free(class_name_raw);
     const CLASS_NAME = try allocator.allocSentinel(u16, class_name_raw.len, 0);
     std.mem.copyForwards(u16, CLASS_NAME[0..class_name_raw.len], class_name_raw);
@@ -176,11 +176,11 @@ pub fn wWinMain(
     wc.lpszClassName = CLASS_NAME;
     _ = RegisterClassExW(&wc);
 
-    const window_name_raw: []win.WCHAR = try std.unicode.utf8ToUtf16LeAlloc(allocator, "pity");
+    const window_name_raw: []win.WCHAR = try std.unicode.utf8ToUtf16LeAlloc(allocator, "zig win32 vulkan");
     defer allocator.free(window_name_raw);
     const WINDOW_NAME = try allocator.allocSentinel(u16, window_name_raw.len, 0);
     std.mem.copyForwards(u16, WINDOW_NAME[0..window_name_raw.len], window_name_raw);
-    const hwnd: win.HWND = CreateWindowExW(
+    const hwnd: vk.c.HWND = CreateWindowExW(
         0, // Optional window styles.
         CLASS_NAME, // Window class
         WINDOW_NAME, // Window text
