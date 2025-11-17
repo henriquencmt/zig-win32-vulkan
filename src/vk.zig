@@ -43,6 +43,7 @@ const SwapChainSupportDetails = struct {
 const Vertex = struct {
     pos: [2]f32,
     color: [3]f32,
+    tex_coord: [2]f32,
 
     pub fn getBindingDescription() c.VkVertexInputBindingDescription {
         const binding_description = c.VkVertexInputBindingDescription{
@@ -54,8 +55,8 @@ const Vertex = struct {
         return binding_description;
     }
 
-    pub fn getAttributeDescriptions() [2]c.VkVertexInputAttributeDescription {
-        const attribute_descriptions = [2]c.VkVertexInputAttributeDescription{
+    pub fn getAttributeDescriptions() [3]c.VkVertexInputAttributeDescription {
+        const attribute_descriptions = [3]c.VkVertexInputAttributeDescription{
             .{
                 .binding = 0,
                 .location = 0,
@@ -67,6 +68,12 @@ const Vertex = struct {
                 .location = 1,
                 .format = c.VK_FORMAT_R32G32B32_SFLOAT,
                 .offset = @offsetOf(Vertex, "color"),
+            },
+            .{
+                .binding = 0,
+                .location = 2,
+                .format = c.VK_FORMAT_R32G32_SFLOAT,
+                .offset = @offsetOf(Vertex, "tex_coord"),
             },
         };
 
@@ -90,10 +97,10 @@ const max_frames_in_flight: u8 = 2;
 var start_time: i64 = undefined;
 
 const vertices = [_]Vertex{
-    .{ .pos = .{ -0.5, -0.5 }, .color = .{ 1.0, 0.0, 0.0 } },
-    .{ .pos = .{ 0.5, -0.5 }, .color = .{ 0.0, 1.0, 0.0 } },
-    .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0.0, 0.0, 1.0 } },
-    .{ .pos = .{ -0.5, 0.5 }, .color = .{ 1.0, 1.0, 1.0 } },
+    .{ .pos = .{ -0.5, -0.5 }, .color = .{ 1.0, 0.0, 0.0 }, .tex_coord = .{ 1.0, 0.0 } },
+    .{ .pos = .{ 0.5, -0.5 }, .color = .{ 0.0, 1.0, 0.0 }, .tex_coord = .{ 0.0, 0.0 } },
+    .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0.0, 0.0, 1.0 }, .tex_coord = .{ 0.0, 1.0 } },
+    .{ .pos = .{ -0.5, 0.5 }, .color = .{ 1.0, 1.0, 1.0 }, .tex_coord = .{ 1.0, 1.0 } },
 };
 const indices = [_]u16{ 0, 1, 2, 2, 3, 0 };
 
@@ -288,6 +295,8 @@ pub fn init(
         descriptor_set_layout,
         descriptor_pool,
         uniform_buffers,
+        texture_image_view,
+        texture_sampler,
     );
 
     const command_buffers = try createCommandBuffers(allocator, device, command_pool);
@@ -763,14 +772,31 @@ fn createDescriptorSetLayout(device: c.VkDevice) !c.VkDescriptorSetLayout {
         .pImmutableSamplers = null, // Optional
     };
 
+    const sampler_layout_binding = c.VkDescriptorSetLayoutBinding{
+        .binding = 1,
+        .descriptorCount = 1,
+        .descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .pImmutableSamplers = null,
+        .stageFlags = c.VK_SHADER_STAGE_FRAGMENT_BIT,
+    };
+
+    const bindings = [2]c.VkDescriptorSetLayoutBinding{ ubo_layout_binding, sampler_layout_binding };
+
     const layout_info = c.VkDescriptorSetLayoutCreateInfo{
         .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 1,
-        .pBindings = &ubo_layout_binding,
+        .bindingCount = @intCast(bindings.len),
+        .pBindings = &bindings,
     };
 
     var descriptor_set_layout: c.VkDescriptorSetLayout = undefined;
-    std.debug.assert(c.vkCreateDescriptorSetLayout(device, &layout_info, null, &descriptor_set_layout) == c.VK_SUCCESS);
+    std.debug.assert(
+        c.vkCreateDescriptorSetLayout(
+            device,
+            &layout_info,
+            null,
+            &descriptor_set_layout,
+        ) == c.VK_SUCCESS,
+    );
 
     return descriptor_set_layout;
 }
@@ -1514,15 +1540,21 @@ fn createUniformBuffers(
 }
 
 fn createDescriptorPool(device: c.VkDevice) !c.VkDescriptorPool {
-    const pool_size = c.VkDescriptorPoolSize{
-        .type = c.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .descriptorCount = @intCast(max_frames_in_flight),
+    const pool_sizes = [2]c.VkDescriptorPoolSize{
+        .{
+            .type = c.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = @intCast(max_frames_in_flight),
+        },
+        .{
+            .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = @intCast(max_frames_in_flight),
+        },
     };
 
     const pool_info = c.VkDescriptorPoolCreateInfo{
         .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .poolSizeCount = 1,
-        .pPoolSizes = &pool_size,
+        .poolSizeCount = @intCast(pool_sizes.len),
+        .pPoolSizes = &pool_sizes,
         .maxSets = @intCast(max_frames_in_flight),
     };
 
@@ -1538,6 +1570,8 @@ fn createDescriptorSets(
     descriptor_set_layout: c.VkDescriptorSetLayout,
     descriptor_pool: c.VkDescriptorPool,
     uniform_buffers: []c.VkBuffer,
+    texture_image_view: c.VkImageView,
+    texture_sampler: c.VkSampler,
 ) ![]c.VkDescriptorSet {
     const layouts = [_]c.VkDescriptorSetLayout{descriptor_set_layout} ** max_frames_in_flight;
     const alloc_info = c.VkDescriptorSetAllocateInfo{
@@ -1557,19 +1591,36 @@ fn createDescriptorSets(
             .range = @sizeOf(UniformBufferObject),
         };
 
-        const descriptor_write = c.VkWriteDescriptorSet{
-            .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = descriptor_sets[i],
-            .dstBinding = 0,
-            .dstArrayElement = 0,
-            .descriptorType = c.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            .descriptorCount = 1,
-            .pBufferInfo = &buffer_info,
-            .pImageInfo = null, // Optional
-            .pTexelBufferView = null, // Optional
+        const image_info = c.VkDescriptorImageInfo{
+            .imageLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .imageView = texture_image_view,
+            .sampler = texture_sampler,
         };
 
-        c.vkUpdateDescriptorSets(device, 1, &descriptor_write, 0, null);
+        const descriptor_writes = [2]c.VkWriteDescriptorSet{
+            .{
+                .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = descriptor_sets[i],
+                .dstBinding = 0,
+                .dstArrayElement = 0,
+                .descriptorType = c.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .descriptorCount = 1,
+                .pBufferInfo = &buffer_info,
+                .pImageInfo = null, // Optional
+                .pTexelBufferView = null, // Optional
+            },
+            .{
+                .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = descriptor_sets[i],
+                .dstBinding = 1,
+                .dstArrayElement = 0,
+                .descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .pImageInfo = &image_info,
+            },
+        };
+
+        c.vkUpdateDescriptorSets(device, descriptor_writes.len, &descriptor_writes, 0, null);
     }
 
     return descriptor_sets;
